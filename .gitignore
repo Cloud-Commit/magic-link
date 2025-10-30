@@ -1,0 +1,32 @@
+# Ignore Maven target directory
+/target/
+
+# Ignore build output directories
+bin/
+build/
+out/
+
+# Ignore IDE settings (Eclipse, IntelliJ, VS Code, etc.)
+*.iml
+.idea/
+.project
+.classpath
+.settings/
+.vscode/
+.github/
+
+# Ignore logs and temporary files
+*.log
+*.tmp
+*.swp
+*.bak
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore compiled Java class files
+*.class
+
+# Ignore dependency directories (if ever used)
+lib/
