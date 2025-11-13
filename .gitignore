@@ -30,3 +30,6 @@ Thumbs.db
 
 # Ignore dependency directories (if ever used)
 lib/
+
+*.ps1
+SECURITY-FINDING-RACE-CONDITION.md

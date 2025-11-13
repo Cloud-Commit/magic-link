@@ -14,9 +14,11 @@ import java.util.UUID;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import org.keycloak.models.UserSessionModel;
+import org.jboss.logging.Logger;
 
 public class AdminLinkActionTokenProvider implements RealmResourceProvider {
 
+    private static final Logger logger = Logger.getLogger(AdminLinkActionTokenProvider.class);
     private final KeycloakSession session;
 
     public AdminLinkActionTokenProvider(KeycloakSession session) {
@@ -38,19 +40,33 @@ public class AdminLinkActionTokenProvider implements RealmResourceProvider {
         String userId = (String) payload.get("userId");
         int ttlSeconds = ((Number) payload.getOrDefault("ttlSeconds", 60)).intValue();
 
-        // Validate bearer token - Keycloak's authenticator already validates signature, expiration, issuer, etc.
-        // If this returns non-null, the token is valid and trusted
-        var auth = new AppAuthManager.BearerTokenAuthenticator(session).authenticate();
-        if (auth == null) {
-            return Response.status(Response.Status.UNAUTHORIZED).entity("Invalid or missing bearer token").build();
+        // Validate bearer token - ONLY accepts master realm tokens (cross-realm access)
+        // Master admin must authenticate to master realm, then can generate magic links for any realm
+        RealmModel masterRealm = session.realms().getRealmByName("master");
+        if (masterRealm == null) {
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                .entity("Master realm not found")
+                .build();
         }
         
-        // Allow cross-realm access if caller is from master realm
-        // Master realm admins can issue tokens for users in any realm
-        // Note: The bearer token's realm is embedded in the token's issuer claim
-        // Keycloak's BearerTokenAuthenticator validates the token is for the current request realm
-        // So if we're here with a valid auth, the token matches the URL realm OR is from master
-        // For simplicity, we'll allow any valid token (master admins use master realm tokens with proper cross-realm permissions)
+        // Switch to master realm context to validate master token
+        RealmModel originalRealm = session.getContext().getRealm();
+        Object authResult;
+        try {
+            session.getContext().setRealm(masterRealm);
+            authResult = new AppAuthManager.BearerTokenAuthenticator(session).authenticate();
+        } finally {
+            // Restore original realm context
+            session.getContext().setRealm(originalRealm);
+        }
+        
+        var auth = authResult;
+        
+        if (auth == null) {
+            return Response.status(Response.Status.UNAUTHORIZED)
+                .entity("Invalid or missing bearer token. Must use master realm access token.")
+                .build();
+        }
 
         // Basic validation of target user
         RealmModel realm = session.getContext().getRealm();
@@ -113,9 +129,12 @@ public class AdminLinkActionTokenProvider implements RealmResourceProvider {
             return Response.status(Response.Status.BAD_REQUEST).entity("invalid or consumed token").build();
         }
 
+        // Consume token immediately to minimize race condition window
+        // Parse from local 'data' variable (not from attribute) for remaining validation
+        user.removeAttribute(attrKey);
+
         String[] parts = data.split("\\|", 3);
         if (parts.length < 3) {
-            user.removeAttribute(attrKey);
             return Response.status(Response.Status.BAD_REQUEST).entity("invalid token metadata").build();
         }
 
@@ -124,12 +143,10 @@ public class AdminLinkActionTokenProvider implements RealmResourceProvider {
         try {
             exp = Integer.parseInt(parts[1]);
         } catch (NumberFormatException nfe) {
-            user.removeAttribute(attrKey);
             return Response.status(Response.Status.BAD_REQUEST).entity("invalid token metadata").build();
         }
 
         if (org.keycloak.common.util.Time.currentTime() > exp) {
-            user.removeAttribute(attrKey);
             return Response.status(Response.Status.BAD_REQUEST).entity("token expired").build();
         }
 
@@ -140,9 +157,11 @@ public class AdminLinkActionTokenProvider implements RealmResourceProvider {
             redirectUri = String.format("/admin/%s/console/", realm.getName());
         }
 
+        // Validate redirect URI to prevent open redirect attacks
+        redirectUri = validateAndSanitizeRedirectUri(redirectUri, realm);
+
         UserSessionModel userSession = session.sessions().getUserSession(realm, sessionId);
         if (userSession == null) {
-            user.removeAttribute(attrKey);
             return Response.status(Response.Status.BAD_REQUEST).entity("session not found").build();
         }
 
@@ -154,9 +173,7 @@ public class AdminLinkActionTokenProvider implements RealmResourceProvider {
             return Response.status(Response.Status.INTERNAL_SERVER_ERROR).entity("failed to set login cookie").build();
         }
 
-        // consume exchange token
-        user.removeAttribute(attrKey);
-
+        // Token already consumed at line 131 (immediately after null check)
         return Response.seeOther(URI.create(redirectUri)).build();
     }
 
@@ -165,5 +182,72 @@ public class AdminLinkActionTokenProvider implements RealmResourceProvider {
         // Nothing to close
     }
 
- 
+    /**
+     * Validates and sanitizes redirect URI to prevent open redirect attacks.
+     * Only allows relative paths starting with /admin/ or /realms/
+     * Blocks absolute URLs, path traversal, and dangerous protocols.
+     * 
+     * @param redirectUri The URI to validate
+     * @param realm The current realm
+     * @return A safe redirect URI (defaults to admin console if validation fails)
+     */
+    private String validateAndSanitizeRedirectUri(String redirectUri, RealmModel realm) {
+        String defaultRedirect = String.format("/admin/%s/console/", realm.getName());
+        
+        if (redirectUri == null || redirectUri.trim().isEmpty()) {
+            return defaultRedirect;
+        }
+        
+        redirectUri = redirectUri.trim();
+        
+        try {
+            URI uri = new URI(redirectUri);
+            
+            // Block absolute URIs (must be relative paths only)
+            if (uri.isAbsolute()) {
+                logger.warnf("Blocked absolute redirect URI: %s", redirectUri);
+                return defaultRedirect;
+            }
+            
+            // Block protocol-relative URLs (//example.com)
+            if (redirectUri.startsWith("//")) {
+                logger.warnf("Blocked protocol-relative redirect URI: %s", redirectUri);
+                return defaultRedirect;
+            }
+            
+            // Block dangerous protocols (javascript:, data:, file:, etc.)
+            if (redirectUri.matches("^[a-zA-Z][a-zA-Z0-9+.-]*:.*")) {
+                logger.warnf("Blocked redirect URI with protocol: %s", redirectUri);
+                return defaultRedirect;
+            }
+            
+            // Must start with /admin/ or /realms/
+            if (!redirectUri.startsWith("/admin/") && !redirectUri.startsWith("/realms/")) {
+                logger.warnf("Blocked redirect URI not starting with /admin/ or /realms/: %s", redirectUri);
+                return defaultRedirect;
+            }
+            
+            // Normalize path and check for path traversal
+            java.nio.file.Path normalized = java.nio.file.Paths.get(redirectUri).normalize();
+            String normalizedStr = normalized.toString().replace('\\', '/');
+            
+            // After normalization, must still start with /admin/ or /realms/
+            if (!normalizedStr.startsWith("/admin/") && !normalizedStr.startsWith("/realms/")) {
+                logger.warnf("Blocked path traversal in redirect URI: %s -> %s", redirectUri, normalizedStr);
+                return defaultRedirect;
+            }
+            
+            // Block newline characters (HTTP response splitting)
+            if (normalizedStr.contains("\n") || normalizedStr.contains("\r")) {
+                logger.warnf("Blocked redirect URI with newline characters: %s", redirectUri);
+                return defaultRedirect;
+            }
+            
+            return normalizedStr;
+            
+        } catch (Exception e) {
+            logger.warnf("Invalid redirect URI format: %s - %s", redirectUri, e.getMessage());
+            return defaultRedirect;
+        }
+    }
 }
